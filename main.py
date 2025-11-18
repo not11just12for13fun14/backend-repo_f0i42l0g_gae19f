@@ -1,13 +1,16 @@
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
 
 from database import db, create_document, get_documents
 from schemas import Company, Opportunity, Interview, InterviewAnswer, ProposalDraft
+
+# Optional parsers
+from io import BytesIO
 
 app = FastAPI(title="AI-Powered EU Funding Vetting API")
 
@@ -159,6 +162,11 @@ class GenerateProposalRequest(BaseModel):
     chosen_opportunity_index: int
 
 
+class AutoFillResponse(BaseModel):
+    answers: List[InterviewAnswer]
+    summary: Optional[str] = None
+
+
 # ---- Routes ----
 @app.get("/api/opportunities", response_model=List[Opportunity])
 def list_opportunities():
@@ -253,6 +261,154 @@ def generate_proposal(payload: GenerateProposalRequest):
     )
     create_document("proposaldraft", draft)
     return draft
+
+
+# -------- File upload → auto-fill answers --------
+
+def _safe_text_from_pdf(data: bytes) -> str:
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(BytesIO(data))
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(texts)
+    except Exception:
+        return ""
+
+
+def _safe_text_from_docx(data: bytes) -> str:
+    try:
+        import docx  # python-docx
+        doc = docx.Document(BytesIO(data))
+        return "\n".join([p.text for p in doc.paragraphs])
+    except Exception:
+        return ""
+
+
+def _guess_text(file: UploadFile, data: bytes) -> str:
+    name = file.filename.lower() if file.filename else ""
+    if name.endswith('.pdf'):
+        return _safe_text_from_pdf(data)
+    if name.endswith('.docx'):
+        return _safe_text_from_docx(data)
+    # Fallback: try decode as text
+    for enc in ["utf-8", "latin-1", "utf-16"]:
+        try:
+            return data.decode(enc)
+        except Exception:
+            continue
+    return ""
+
+
+def _extract_sentences(text: str) -> List[str]:
+    # naive sentence split
+    parts = []
+    for seg in text.replace("\r", " ").split("\n"):
+        for s in seg.split('.'):
+            s = s.strip()
+            if len(s) > 0:
+                parts.append(s)
+    return parts
+
+
+def _find_section(sentences: List[str], keywords: List[str]) -> Optional[str]:
+    for s in sentences:
+        low = s.lower()
+        if any(k in low for k in keywords):
+            return s.strip()
+    return None
+
+
+def extract_answers_from_text(text: str) -> Tuple[List[InterviewAnswer], str]:
+    sentences = _extract_sentences(text)
+    summary = " ".join(sentences[:3])[:600]
+
+    answers: Dict[str, str] = {}
+
+    # q1: project summary
+    answers["q1"] = summary or (sentences[0] if sentences else "")
+
+    # q2: impact
+    s = _find_section(sentences, ["impact", "societal", "environment", "climate", "economic"])
+    if s:
+        answers["q2"] = s
+
+    # q3: TRL
+    trl_sentence = _find_section(sentences, ["trl", "technology readiness"])
+    if trl_sentence:
+        answers["q3"] = trl_sentence
+
+    # q4: market/customers
+    market = _find_section(sentences, ["market", "customer", "users", "clients", "segment"])
+    if market:
+        answers["q4"] = market
+
+    # q5: consortium/partners
+    partners = _find_section(sentences, ["partner", "consortium", "university", "research", "industry partner"])
+    if partners:
+        answers["q5"] = partners
+
+    # q6: size/country
+    size = _find_section(sentences, ["sme", "startup", "large", "employees", "country"])
+    if size:
+        answers["q6"] = size
+
+    # q7: budget/timeline
+    budget = _find_section(sentences, ["budget", "timeline", "month", "year", "milestone", "€", "eur"]) 
+    if budget:
+        answers["q7"] = budget
+
+    # q8: prior funding
+    prior = _find_section(sentences, ["grant", "funding", "h2020", "horizon", "eic", "life"])
+    if prior:
+        answers["q8"] = prior
+
+    # q9: keywords
+    # attempt to collect 3-5 nouns/keywords by grabbing capitalized/known tech words
+    kws = []
+    for s in sentences[:50]:
+        for token in s.split():
+            t = token.strip(',;()').lower()
+            if t in ["ai", "ml", "iot", "robotics", "space", "climate", "manufacturing", "biotech", "energy", "software"]:
+                kws.append(t)
+    if kws:
+        answers["q9"] = ", ".join(sorted(set(kws))[:5])
+
+    # q10: risks
+    risk = _find_section(sentences, ["risk", "challenge", "mitigate", "uncertainty"])
+    if risk:
+        answers["q10"] = risk
+
+    filled = [InterviewAnswer(question_id=k, answer=v) for k, v in answers.items()]
+    return filled, summary
+
+
+@app.post("/api/interview/upload", response_model=AutoFillResponse)
+async def upload_document(interview_id: str = Form(...), file: UploadFile = File(...)):
+    # Read bytes
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    text = _guess_text(file, data)
+    if not text or len(text.strip()) == 0:
+        raise HTTPException(status_code=400, detail="Could not extract text from file. Supported: PDF, DOCX, TXT")
+
+    # Extract structured answers
+    answers, summary = extract_answers_from_text(text)
+
+    # Optionally append to the latest interview record (simple demo without retrieval by ID)
+    try:
+        _ = get_documents("interview", {"_id": {"$exists": True}})
+        # We are not updating the document here to avoid dependency on ObjectId ops; frontend will use the suggestions
+    except Exception:
+        pass
+
+    return AutoFillResponse(answers=answers, summary=summary)
 
 
 if __name__ == "__main__":
